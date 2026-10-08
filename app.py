@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -32,6 +33,11 @@ from pypdf import PdfReader
 # Override with the GEMINI_MODEL secret / env var, or in the sidebar,
 # e.g. "gemini-2.5-flash".
 DEFAULT_MODEL = "gemini-flash-latest"
+
+# Tried in order if the chosen model is overloaded / over quota.
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+RETRIES_PER_MODEL = 3        # attempts per model before moving on
+RETRY_DELAY_SECONDS = 2      # doubles after each failed attempt (2s, 4s, ...)
 
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000
@@ -264,9 +270,18 @@ Also return:
 </resume>"""
 
 
-def call_gemini(api_key: str, model: str, prompt: str) -> str:
-    client = genai.Client(api_key=api_key)
+def _is_transient(exc: Exception) -> bool:
+    """Errors worth retrying: overload, rate limit, timeouts, server errors."""
+    low = str(exc).lower()
+    return any(
+        s in low
+        for s in ("503", "500", "502", "504", "429", "unavailable", "overloaded",
+                  "high demand", "resource_exhausted", "timed out", "timeout",
+                  "deadline", "internal", "connection")
+    )
 
+
+def _generate_once(client, model: str, prompt: str) -> str:
     def _generate(use_schema: bool):
         kwargs = {"system_instruction": SYSTEM_INSTRUCTION, "response_mime_type": "application/json"}
         if use_schema:
@@ -291,6 +306,28 @@ def call_gemini(api_key: str, model: str, prompt: str) -> str:
     if not text:
         raise RuntimeError("Gemini returned an empty response (it may have been blocked). Try again.")
     return text
+
+
+def call_gemini(api_key: str, model: str, prompt: str) -> tuple[str, str]:
+    """Call Gemini with retries and model fallback. Returns (text, model_used)."""
+    client = genai.Client(api_key=api_key)
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_exc: Exception | None = None
+
+    for candidate in models:
+        delay = RETRY_DELAY_SECONDS
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                return _generate_once(client, candidate, prompt), candidate
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if not _is_transient(exc):
+                    raise  # bad key, bad request, etc. - retrying will not help
+                if attempt < RETRIES_PER_MODEL - 1:
+                    time.sleep(delay)
+                    delay *= 2
+        # all attempts on this model failed -> try the next model
+    raise last_exc  # type: ignore[misc]
 
 
 def parse_json_response(text: str) -> dict:
@@ -397,9 +434,11 @@ def analyze_resume(api_key: str, model: str, resume_text: str, job_description: 
     prompt = build_prompt(resume_text, job_description)
     last_error: Exception | None = None
     for _ in range(2):  # one retry if the JSON is malformed
-        raw = call_gemini(api_key, model, prompt)
+        raw, used_model = call_gemini(api_key, model, prompt)
         try:
-            return normalize_report(parse_json_response(raw))
+            report = normalize_report(parse_json_response(raw))
+            report["model_used"] = used_model
+            return report
         except (ValueError, json.JSONDecodeError) as exc:
             last_error = exc
     raise RuntimeError(f"Could not understand the AI response: {last_error}")
@@ -410,12 +449,14 @@ def friendly_error(exc: Exception) -> str:
     low = msg.lower()
     if "api key" in low or "api_key" in low or "401" in low or "403" in low or "permission" in low:
         return "Gemini rejected the API key. Check that it is correct and the Gemini API is enabled."
-    if "429" in low or "quota" in low or "resource_exhausted" in low or "rate" in low:
-        return "Gemini rate limit / quota reached. Wait a minute and try again."
     if "404" in low or "not found" in low:
         return "That Gemini model name was not found. Change the model in the sidebar (e.g. gemini-2.5-flash)."
-    if "timed out" in low or "timeout" in low or "unavailable" in low or "503" in low:
-        return "Gemini is temporarily unavailable. Please try again."
+    if "429" in low or "quota" in low or "resource_exhausted" in low:
+        return ("Gemini quota / rate limit reached on all models tried. Wait a minute and try again, "
+                "or check your quota in Google AI Studio.")
+    if _is_transient(exc):
+        return ("Gemini is overloaded right now (the app already retried and tried backup models). "
+                "Please try again in a minute.")
     return f"Analysis failed: {msg}"
 
 
@@ -484,6 +525,8 @@ def render_report(report: dict, resume_text: str, filename: str) -> None:
         st.progress(score / 100)
     if report["summary"]:
         st.write(report["summary"])
+    if report.get("model_used"):
+        st.caption(f"Analysed with `{report['model_used']}`")
     st.caption(
         "This is an AI-based estimate, not the output of a specific ATS. Different "
         "systems (Workday, Greenhouse, Lever...) score differently - use it as a guide."
@@ -604,6 +647,8 @@ def main() -> None:
                 report = analyze_resume(api_key, model, resume_text, job_description)
         except Exception as exc:  # noqa: BLE001
             st.error(friendly_error(exc))
+            with st.expander("Technical details"):
+                st.code(f"{type(exc).__name__}: {exc}")
             return
         st.session_state["result"] = {
             "signature": signature,

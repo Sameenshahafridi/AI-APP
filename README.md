@@ -105,6 +105,7 @@ app's sharing settings, leave the secret out so each user pastes their own key i
 | "Very little text could be extracted" | The resume is probably a scanned image. Export a text-based PDF/DOCX. |
 | "Gemini rejected the API key" | Re-copy the key; make sure it's from Google AI Studio. |
 | "Model was not found" | Change the model in the sidebar (e.g. `gemini-2.5-flash`). |
+| "Gemini is overloaded" (503) | Temporary on Google's side. The app retries 3x per model and falls back to `gemini-2.5-flash`, then `gemini-2.5-flash-lite`. If all fail, wait a minute and retry. Edit `FALLBACK_MODELS` in `app.py` to change the backups. |
 | Rate limit / quota message | Wait a minute, or enable billing on your Google AI project. |
 | `ModuleNotFoundError` on deploy | Make sure `requirements.txt` is in the repo root. |
 

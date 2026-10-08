@@ -29,15 +29,19 @@ from pypdf import PdfReader
 # Configuration
 # --------------------------------------------------------------------------- #
 
-# "gemini-flash-latest" always points to Google's newest stable Flash model.
-# Override with the GEMINI_MODEL secret / env var, or in the sidebar,
-# e.g. "gemini-2.5-flash".
-DEFAULT_MODEL = "gemini-flash-latest"
+# Current stable Flash model. Override with the GEMINI_MODEL secret / env var,
+# or in the sidebar. Google retires old models regularly, so the app also
+# falls back to the models below (and finally to auto-discovery) if the chosen
+# one is retired, overloaded or over quota.
+DEFAULT_MODEL = "gemini-3.8-flash"
 
-# Tried in order if the chosen model is overloaded / over quota.
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
-RETRIES_PER_MODEL = 3        # attempts per model before moving on
+# Tried in order if the chosen model is unavailable.
+FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"]
+RETRIES_PER_MODEL = 3        # attempts per model on temporary errors
 RETRY_DELAY_SECONDS = 2      # doubles after each failed attempt (2s, 4s, ...)
+
+# Words that mark non-text models when auto-discovering Flash models.
+_NON_TEXT_MODEL_WORDS = ("image", "tts", "live", "audio", "embed", "omni", "robot", "computer", "exp")
 
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000
@@ -308,26 +312,76 @@ def _generate_once(client, model: str, prompt: str) -> str:
     return text
 
 
-def call_gemini(api_key: str, model: str, prompt: str) -> tuple[str, str]:
-    """Call Gemini with retries and model fallback. Returns (text, model_used)."""
-    client = genai.Client(api_key=api_key)
-    models = [model] + [m for m in FALLBACK_MODELS if m != model]
-    last_exc: Exception | None = None
+def _is_model_unavailable(exc: Exception) -> bool:
+    """The model itself is retired / unknown / not allowed for this key."""
+    low = str(exc).lower()
+    return (
+        "404" in low
+        or "not_found" in low
+        or "no longer available" in low
+        or ("model" in low and "not found" in low)
+    )
 
-    for candidate in models:
+
+def discover_flash_models(client) -> list[str]:
+    """Ask the API which Flash text models this key can use (newest first)."""
+    try:
+        found = []
+        for m in client.models.list():
+            name = str(getattr(m, "name", "")).replace("models/", "", 1)
+            low = name.lower()
+            actions = getattr(m, "supported_actions", None)
+            if actions and "generateContent" not in actions:
+                continue
+            if "flash" not in low or any(w in low for w in _NON_TEXT_MODEL_WORDS):
+                continue
+            found.append(name)
+    except Exception:  # noqa: BLE001 - discovery is best-effort
+        return []
+
+    def version(name: str) -> float:
+        match = re.search(r"(\d+(?:\.\d+)?)", name)
+        return float(match.group(1)) if match else 0.0
+
+    return sorted(set(found), key=lambda n: (-version(n), "lite" in n, n))
+
+
+def _try_models(client, candidates: list[str], prompt: str) -> tuple[str, str]:
+    last_exc: Exception | None = None
+    for candidate in candidates:
         delay = RETRY_DELAY_SECONDS
         for attempt in range(RETRIES_PER_MODEL):
             try:
                 return _generate_once(client, candidate, prompt), candidate
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
+                if _is_model_unavailable(exc):
+                    break  # retired/unknown model: skip straight to the next one
                 if not _is_transient(exc):
                     raise  # bad key, bad request, etc. - retrying will not help
                 if attempt < RETRIES_PER_MODEL - 1:
                     time.sleep(delay)
                     delay *= 2
-        # all attempts on this model failed -> try the next model
     raise last_exc  # type: ignore[misc]
+
+
+def call_gemini(api_key: str, model: str, prompt: str) -> tuple[str, str]:
+    """Call Gemini with retries, model fallback and auto-discovery.
+
+    Returns (text, model_used).
+    """
+    client = genai.Client(api_key=api_key)
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    try:
+        return _try_models(client, candidates, prompt)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_model_unavailable(exc):
+            raise
+        # Every configured model is retired/unavailable: see what the key can use.
+        extra = [m for m in discover_flash_models(client) if m not in candidates][:3]
+        if not extra:
+            raise
+        return _try_models(client, extra, prompt)
 
 
 def parse_json_response(text: str) -> dict:
@@ -450,7 +504,10 @@ def friendly_error(exc: Exception) -> str:
     if "api key" in low or "api_key" in low or "401" in low or "403" in low or "permission" in low:
         return "Gemini rejected the API key. Check that it is correct and the Gemini API is enabled."
     if "404" in low or "not found" in low:
-        return "That Gemini model name was not found. Change the model in the sidebar (e.g. gemini-2.5-flash)."
+        return (
+            "None of the Gemini models tried are available to your API key (Google retires old models). "
+            f"Set the model in the sidebar to the current one, e.g. {DEFAULT_MODEL}."
+        )
     if "429" in low or "quota" in low or "resource_exhausted" in low:
         return ("Gemini quota / rate limit reached on all models tried. Wait a minute and try again, "
                 "or check your quota in Google AI Studio.")

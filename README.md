@@ -44,7 +44,7 @@ ats-checker/
    - Create `.streamlit/secrets.toml`:
      ```toml
      GEMINI_API_KEY = "your-key-here"
-     # GEMINI_MODEL = "gemini-2.5-flash"   # optional
+     # GEMINI_MODEL = "gemini-3.8-flash"   # optional
      ```
    - Or set an environment variable: `export GEMINI_API_KEY="your-key-here"`
 4. **Start the app:**
@@ -54,9 +54,10 @@ ats-checker/
 
 ### Choosing the Gemini model
 
-The default is `gemini-flash-latest`, an alias that always points to Google's newest stable Flash model.
-To pin a specific version, set `GEMINI_MODEL` (secret or env var) or type it into the sidebar, e.g. `gemini-2.5-flash`.
-Model names change often, so check https://ai.google.dev/gemini-api/docs/models if you get a "model not found" error.
+The default is `gemini-3.8-flash`. To use another model, set `GEMINI_MODEL` (secret or env var) or type it into the sidebar.
+Google retires models regularly (for example `gemini-2.5-flash` is no longer available to new users), so the app is built to cope:
+if the chosen model is retired it skips to a backup (`gemini-3.7-flash`, `gemini-3.5-flash`, `gemini-3.1-flash-lite`), and if all of
+those are gone it asks the API which Flash models your key can use. Current names: https://ai.google.dev/gemini-api/docs/models
 
 ## Push to GitHub
 
@@ -104,8 +105,8 @@ app's sharing settings, leave the secret out so each user pastes their own key i
 |---|---|
 | "Very little text could be extracted" | The resume is probably a scanned image. Export a text-based PDF/DOCX. |
 | "Gemini rejected the API key" | Re-copy the key; make sure it's from Google AI Studio. |
-| "Model was not found" | Change the model in the sidebar (e.g. `gemini-2.5-flash`). |
-| "Gemini is overloaded" (503) | Temporary on Google's side. The app retries 3x per model and falls back to `gemini-2.5-flash`, then `gemini-2.5-flash-lite`. If all fail, wait a minute and retry. Edit `FALLBACK_MODELS` in `app.py` to change the backups. |
+| "None of the Gemini models are available" (404) | Google retired the model. Set the sidebar model to the current one (e.g. `gemini-3.8-flash`) and check your `GEMINI_MODEL` secret isn't set to an old name. |
+| "Gemini is overloaded" (503) | Temporary on Google's side. The app retries 3x per model and falls back to the backup models in `FALLBACK_MODELS`. If all fail, wait a minute and retry. Edit `FALLBACK_MODELS` in `app.py` to change the backups. |
 | Rate limit / quota message | Wait a minute, or enable billing on your Google AI project. |
 | `ModuleNotFoundError` on deploy | Make sure `requirements.txt` is in the repo root. |
 
